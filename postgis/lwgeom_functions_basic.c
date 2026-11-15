@@ -2127,6 +2127,61 @@ Datum LWGEOM_same(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(gserialized_cmp(g1, g2) == 0);
 }
 
+/*
+ * The arguments and result of the last envelope a call site built. With bound
+ * parameters in a generic plan, an envelope in a target list is built again
+ * for every row.
+ */
+typedef struct
+{
+	double floats[5];
+	int32_t ints[4];
+	uint32_t bounds_size;
+	GSERIALIZED *result;
+	char bounds[512];
+} EnvelopeCache;
+
+static GSERIALIZED *
+envelope_cache_get(FunctionCallInfo fcinfo, const double *floats, const int32_t *ints, const GSERIALIZED *bounds)
+{
+	EnvelopeCache *cache = fcinfo->flinfo ? (EnvelopeCache *)fcinfo->flinfo->fn_extra : NULL;
+	uint32_t bounds_size = bounds ? VARSIZE(bounds) : 0;
+	GSERIALIZED *copy;
+
+	if (!cache || !cache->result || memcmp(cache->floats, floats, sizeof(cache->floats)) ||
+	    memcmp(cache->ints, ints, sizeof(cache->ints)) || cache->bounds_size != bounds_size ||
+	    (bounds_size && memcmp(cache->bounds, bounds, bounds_size)))
+		return NULL;
+	copy = palloc(VARSIZE(cache->result));
+	memcpy(copy, cache->result, VARSIZE(cache->result));
+	return copy;
+}
+
+static void
+envelope_cache_put(FunctionCallInfo fcinfo, const double *floats, const int32_t *ints, const GSERIALIZED *bounds, const GSERIALIZED *result)
+{
+	EnvelopeCache *cache;
+	uint32_t bounds_size = bounds ? VARSIZE(bounds) : 0;
+
+	if (!fcinfo->flinfo || bounds_size > sizeof(cache->bounds))
+		return;
+	cache = (EnvelopeCache *)fcinfo->flinfo->fn_extra;
+	if (!cache)
+	{
+		cache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(EnvelopeCache));
+		fcinfo->flinfo->fn_extra = cache;
+	}
+	if (cache->result)
+		pfree(cache->result);
+	memcpy(cache->floats, floats, sizeof(cache->floats));
+	memcpy(cache->ints, ints, sizeof(cache->ints));
+	cache->bounds_size = bounds_size;
+	if (bounds_size)
+		memcpy(cache->bounds, bounds, bounds_size);
+	cache->result = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, VARSIZE(result));
+	memcpy(cache->result, result, VARSIZE(result));
+}
+
 PG_FUNCTION_INFO_V1(ST_MakeEnvelope);
 Datum ST_MakeEnvelope(PG_FUNCTION_ARGS)
 {
@@ -2134,6 +2189,8 @@ Datum ST_MakeEnvelope(PG_FUNCTION_ARGS)
 	GSERIALIZED *result;
 	double x1, y1, x2, y2;
 	int32_t srid = SRID_UNKNOWN;
+	double floats[5] = {0};
+	int32_t ints[4] = {0};
 
 	POSTGIS_DEBUG(2, "ST_MakeEnvelope called");
 
@@ -2146,11 +2203,21 @@ Datum ST_MakeEnvelope(PG_FUNCTION_ARGS)
 		srid = PG_GETARG_INT32(4);
 	}
 
+	floats[0] = x1;
+	floats[1] = y1;
+	floats[2] = x2;
+	floats[3] = y2;
+	ints[0] = srid;
+	result = envelope_cache_get(fcinfo, floats, ints, NULL);
+	if (result)
+		PG_RETURN_POINTER(result);
+
 	poly = lwpoly_construct_envelope(srid, x1, y1, x2, y2);
 
 	result = geometry_serialize(lwpoly_as_lwgeom(poly));
 	lwpoly_free(poly);
 
+	envelope_cache_put(fcinfo, floats, ints, NULL, result);
 	PG_RETURN_POINTER(result);
 }
 
@@ -2174,6 +2241,9 @@ Datum ST_TileEnvelope(PG_FUNCTION_ARGS)
 	int32_t srid;
 	GBOX bbox;
 	LWGEOM *g = NULL;
+	GSERIALIZED *result;
+	double floats[5] = {0};
+	int32_t ints[4] = {0};
 
 	POSTGIS_DEBUG(2, "ST_TileEnvelope called");
 
@@ -2182,6 +2252,15 @@ Datum ST_TileEnvelope(PG_FUNCTION_ARGS)
 	y = PG_GETARG_INT32(2);
 
 	bounds = PG_GETARG_GSERIALIZED_P(3);
+
+	floats[0] = PG_NARGS() < 4 ? 0 : PG_GETARG_FLOAT8(4);
+	ints[0] = zoom;
+	ints[1] = x;
+	ints[2] = y;
+	result = envelope_cache_get(fcinfo, floats, ints, bounds);
+	if (result)
+		PG_RETURN_POINTER(result);
+
 	/*
 	 * We deserialize the geometry and recalculate the bounding box here to get
 	 * 64b floating point precision. The serialized bbox has 32b float is not
@@ -2244,11 +2323,9 @@ Datum ST_TileEnvelope(PG_FUNCTION_ARGS)
 	if (x1 < bbox.xmin) x1 = bbox.xmin;
 	if (x2 > bbox.xmax) x2 = bbox.xmax;
 
-	PG_RETURN_POINTER(
-		geometry_serialize(
-		lwpoly_as_lwgeom(
-		lwpoly_construct_envelope(
-			srid, x1, y1, x2, y2))));
+	result = geometry_serialize(lwpoly_as_lwgeom(lwpoly_construct_envelope(srid, x1, y1, x2, y2)));
+	envelope_cache_put(fcinfo, floats, ints, bounds, result);
+	PG_RETURN_POINTER(result);
 }
 
 

@@ -132,25 +132,66 @@ Datum BOX2D_out(PG_FUNCTION_ARGS)
 
 /*convert a GSERIALIZED to BOX2D */
 PG_FUNCTION_INFO_V1(LWGEOM_to_BOX2D);
+/*
+ * The last small geometry a call site boxed. A bound parameter, such as a tile
+ * envelope in a generic plan, is cast again for every row.
+ */
+typedef struct
+{
+	GBOX box;
+	bool isnull;
+	uint32_t size;
+	char data[FLEXIBLE_ARRAY_MEMBER];
+} Box2DCache;
+
+#define BOX2D_CACHE_MAX_SIZE 1024
+
 Datum LWGEOM_to_BOX2D(PG_FUNCTION_ARGS)
 {
 	GSERIALIZED *geom = PG_GETARG_GSERIALIZED_P(0);
-	LWGEOM *lwgeom = lwgeom_from_gserialized(geom);
+	uint32_t size = VARSIZE(geom);
+	Box2DCache *cache = fcinfo->flinfo ? (Box2DCache *)fcinfo->flinfo->fn_extra : NULL;
+	LWGEOM *lwgeom;
 	GBOX gbox;
+	bool isnull = false;
 
-	/* Cannot box empty! */
-	if ( lwgeom_is_empty(lwgeom) )
-		PG_RETURN_NULL();
+	if (cache && cache->size == size && memcmp(cache->data, geom, size) == 0)
+	{
+		if (cache->isnull)
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(gbox_copy(&cache->box));
+	}
 
-	/* Cannot calculate box? */
-	if ( lwgeom_calculate_gbox(lwgeom, &gbox) == LW_FAILURE )
-		PG_RETURN_NULL();
+	lwgeom = lwgeom_from_gserialized(geom);
 
-	/* Strip out higher dimensions */
-	FLAGS_SET_Z(gbox.flags, 0);
-	FLAGS_SET_M(gbox.flags, 0);
+	/* Cannot box empty, or cannot calculate box? */
+	if (lwgeom_is_empty(lwgeom) || lwgeom_calculate_gbox(lwgeom, &gbox) == LW_FAILURE)
+		isnull = true;
+	else
+	{
+		/* Strip out higher dimensions */
+		FLAGS_SET_Z(gbox.flags, 0);
+		FLAGS_SET_M(gbox.flags, 0);
+	}
+	lwgeom_free(lwgeom);
+
+	if (fcinfo->flinfo && size <= BOX2D_CACHE_MAX_SIZE)
+	{
+		if (!cache)
+		{
+			cache = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+						   offsetof(Box2DCache, data) + BOX2D_CACHE_MAX_SIZE);
+			fcinfo->flinfo->fn_extra = cache;
+		}
+		cache->box = gbox;
+		cache->isnull = isnull;
+		cache->size = size;
+		memcpy(cache->data, geom, size);
+	}
 
 	PG_FREE_IF_COPY(geom, 0);
+	if (isnull)
+		PG_RETURN_NULL();
 	PG_RETURN_POINTER(gbox_copy(&gbox));
 }
 
