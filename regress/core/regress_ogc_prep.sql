@@ -292,3 +292,13 @@ SELECT 'covers311', ST_Covers('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))', p) FROM 
 ('LINESTRING(1 10, 10 10, 10 8)'),('LINESTRING(1 10, 10 10, 10 8)'),('LINESTRING(1 10, 10 10, 10 8)')
 ) AS v(p);
 
+-- A cached axis-aligned rectangle answers ST_Intersects for geometries inside it
+SELECT 'intersects_rect', ST_Intersects(p, ST_MakeEnvelope(0, 0, 10, 10)) FROM ( VALUES
+('LINESTRING(1 1, 2 2)'::geometry),('LINESTRING(1 1, 2 2)'),('POLYGON((1 1, 2 1, 2 2, 1 1))'),
+('LINESTRING(9 9, 11 11)'),('LINESTRING(11 11, 12 12)'),('LINESTRING(0 10, 10 10)'),
+('POINT(10 10)'),('GEOMETRYCOLLECTION(POINT(1 1), LINESTRING(2 2, 3 3))'),('LINESTRING(-1 5, -0.5 5)')
+) AS v(p);
+SELECT 'intersects_rotated', ST_Intersects(p, 'POLYGON((5 0, 10 5, 5 10, 0 5, 5 0))') FROM ( VALUES
+('POINT(1 1)'::geometry),('LINESTRING(0.5 0.5, 1 1)'),('LINESTRING(0.5 0.5, 1 1)'),('LINESTRING(4 4, 6 6)')
+) AS v(p);
+

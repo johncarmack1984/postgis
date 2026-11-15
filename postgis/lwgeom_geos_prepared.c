@@ -223,6 +223,46 @@ DeletePrepGeomHashEntry(MemoryContext mcxt)
 * of a cache hit when there is no indexed structure yet
 * available to return.
 */
+/*
+ * Whether lwgeom is a polygon of one ring whose four edges run along the axes
+ * in turn, such as a tile or query envelope, and if so its exact extent.
+ */
+static bool
+lwgeom_is_rectangle(const LWGEOM *lwgeom, GBOX *box)
+{
+	const POINTARRAY *pa;
+	const POINT2D *p0, *p2, *p4;
+	bool previous_along_y = false;
+	uint32_t i;
+
+	if (lwgeom->type != POLYGONTYPE || ((const LWPOLY *)lwgeom)->nrings != 1)
+		return false;
+	pa = ((const LWPOLY *)lwgeom)->rings[0];
+	if (pa->npoints != 5)
+		return false;
+	for (i = 0; i < 4; i++)
+	{
+		const POINT2D *p = getPoint2d_cp(pa, i);
+		const POINT2D *q = getPoint2d_cp(pa, i + 1);
+		const bool along_y = p->x == q->x;
+		/* Each edge moves along one axis, and the edges take turns */
+		if (along_y == (p->y == q->y) || (i && along_y == previous_along_y))
+			return false;
+		previous_along_y = along_y;
+	}
+	p0 = getPoint2d_cp(pa, 0);
+	p2 = getPoint2d_cp(pa, 2);
+	p4 = getPoint2d_cp(pa, 4);
+	if (p0->x != p4->x || p0->y != p4->y)
+		return false;
+	box->flags = 0;
+	box->xmin = p0->x < p2->x ? p0->x : p2->x;
+	box->xmax = p0->x < p2->x ? p2->x : p0->x;
+	box->ymin = p0->y < p2->y ? p0->y : p2->y;
+	box->ymax = p0->y < p2->y ? p2->y : p0->y;
+	return true;
+}
+
 static int
 PrepGeomCacheBuilder(const LWGEOM *lwgeom, GeomCache *cache)
 {
@@ -275,6 +315,7 @@ PrepGeomCacheBuilder(const LWGEOM *lwgeom, GeomCache *cache)
 	prepcache->prepared_geom = GEOSPrepare( prepcache->geom );
 	if ( ! prepcache->prepared_geom ) return LW_FAILURE;
 	prepcache->gcache.argnum = cache->argnum;
+	prepcache->is_rect = lwgeom_is_rectangle(lwgeom, &prepcache->rect);
 
 	/*
 	* In order to find the objects we need to destroy, we keep
@@ -334,6 +375,7 @@ PrepGeomCacheCleaner(GeomCache *cache)
 	prepcache->gcache.argnum = 0;
 	prepcache->prepared_geom = 0;
 	prepcache->geom	= 0;
+	prepcache->is_rect = false;
 
 	return LW_SUCCESS;
 }

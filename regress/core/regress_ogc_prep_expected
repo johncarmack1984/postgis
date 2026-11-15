@@ -149,3 +149,16 @@ covers310|t
 covers311|t
 covers311|t
 covers311|t
+intersects_rect|t
+intersects_rect|t
+intersects_rect|t
+intersects_rect|t
+intersects_rect|f
+intersects_rect|t
+intersects_rect|t
+intersects_rect|t
+intersects_rect|f
+intersects_rotated|f
+intersects_rotated|f
+intersects_rotated|f
+intersects_rotated|t

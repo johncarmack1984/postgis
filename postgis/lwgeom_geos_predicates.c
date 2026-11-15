@@ -214,6 +214,19 @@ Datum ST_Intersects(PG_FUNCTION_ARGS)
 	initGEOS(lwpgnotice, lwgeom_geos_error);
 
 	prep_cache = GetPrepGeomCache(fcinfo, shared_geom1, shared_geom2);
+
+	/*
+	 * Short-circuit 3: a cached rectangle that covers the other geometry's
+	 * bounding box covers all of it. Stored boxes are rounded outwards.
+	 */
+	if (prep_cache && prep_cache->prepared_geom && prep_cache->is_rect)
+	{
+		GBOX box;
+		const GSERIALIZED *other = prep_cache->gcache.argnum == 1 ? geom2 : geom1;
+		if (gserialized_get_gbox_p(other, &box) && gbox_contains_2d(&prep_cache->rect, &box))
+			PG_RETURN_BOOL(true);
+	}
+
 	if ( prep_cache && prep_cache->prepared_geom )
 	{
 		GEOSGeometry *g = prep_cache->gcache.argnum == 1

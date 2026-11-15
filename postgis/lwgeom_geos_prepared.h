@@ -53,6 +53,8 @@ typedef struct {
 	MemoryContext               context_callback;
 	const GEOSPreparedGeometry* prepared_geom;
 	const GEOSGeometry*         geom;
+	bool                        is_rect;
+	GBOX                        rect;
 } PrepGeomCache;
 
 
