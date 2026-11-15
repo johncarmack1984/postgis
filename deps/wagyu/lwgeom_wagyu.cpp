@@ -61,31 +61,79 @@ ptarray_to_wglinearring(const POINTARRAY *pa)
 	return lr;
 }
 
+/*
+ * Whether clipping the polygon to the box would return the same points: every
+ * point lies inside the box, and every ring is closed, has at least four
+ * points and repeats no point twice in a row. Rings with Z or M are compared
+ * in 4D by the clip, so they always go through it.
+ */
+static bool
+lwpoly_clips_to_itself(const LWPOLY *geom, const GBOX *box)
+{
+	if (FLAGS_GET_Z(geom->flags) || FLAGS_GET_M(geom->flags))
+		return false;
+	for (std::uint32_t ring = 0; ring < geom->nrings; ring++)
+	{
+		const POINTARRAY *pa = geom->rings[ring];
+		if (pa->npoints < 4)
+			return false;
+		for (std::uint32_t i = 0; i < pa->npoints; i++)
+		{
+			const POINT2D *p = getPoint2d_cp(pa, i);
+			if (!(box->xmin <= p->x && p->x <= box->xmax && box->ymin <= p->y && p->y <= box->ymax))
+				return false;
+			if (i > 0)
+			{
+				const POINT2D *q = getPoint2d_cp(pa, i - 1);
+				if (p->x == q->x && p->y == q->y)
+					return false;
+			}
+		}
+		const POINT2D *first = getPoint2d_cp(pa, 0);
+		const POINT2D *last = getPoint2d_cp(pa, pa->npoints - 1);
+		if (first->x != last->x || first->y != last->y)
+			return false;
+	}
+	return true;
+}
+
+static void
+lwpoly_append_vwgpoly(const LWPOLY *poly, vwpolygon &vp)
+{
+	for (std::uint32_t ring = 0; ring < poly->nrings; ring++)
+	{
+		wagyu_polygon pol;
+		pol.push_back(ptarray_to_wglinearring(poly->rings[ring]));
+
+		/* If it has an inner ring, push it too */
+		ring++;
+		if (ring != poly->nrings)
+		{
+			pol.push_back(ptarray_to_wglinearring(poly->rings[ring]));
+		}
+
+		vp.push_back(pol);
+	}
+}
+
 static vwpolygon
 lwpoly_to_vwgpoly(const LWPOLY *geom, const GBOX *box)
 {
+	vwpolygon vp;
+
+	if (lwpoly_clips_to_itself(geom, box))
+	{
+		lwpoly_append_vwgpoly(geom, vp);
+		return vp;
+	}
+
 	LWCOLLECTION *geom_clipped_x = lwgeom_clip_to_ordinate_range((LWGEOM *)geom, 'X', box->xmin, box->xmax, 0);
 	LWCOLLECTION *geom_clipped = lwgeom_clip_to_ordinate_range((LWGEOM *)geom_clipped_x, 'Y', box->ymin, box->ymax, 0);
 
-	vwpolygon vp;
 	for (std::uint32_t i = 0; i < geom_clipped->ngeoms; i++)
 	{
 		assert(geom_clipped->geoms[i]->type == POLYGONTYPE);
-		LWPOLY *poly = (LWPOLY *)geom_clipped->geoms[i];
-		for (std::uint32_t ring = 0; ring < poly->nrings; ring++)
-		{
-			wagyu_polygon pol;
-			pol.push_back(ptarray_to_wglinearring(poly->rings[ring]));
-
-			/* If it has an inner ring, push it too */
-			ring++;
-			if (ring != poly->nrings)
-			{
-				pol.push_back(ptarray_to_wglinearring(poly->rings[ring]));
-			}
-
-			vp.push_back(pol);
-		}
+		lwpoly_append_vwgpoly((LWPOLY *)geom_clipped->geoms[i], vp);
 	}
 
 	lwgeom_free((LWGEOM *)geom_clipped_x);
