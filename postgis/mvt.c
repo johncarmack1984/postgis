@@ -910,7 +910,11 @@ mvt_clip_and_validate_geos(LWGEOM *lwgeom, uint8_t basic_type, uint32_t extent, 
  */
 
 /** Most vertices a ring can have and still take the fast path */
-#define MVT_SIMPLE_RING_MAX_POINTS 128
+#define MVT_SIMPLE_RING_MAX_POINTS (1 << 16)
+/** Rings with up to this many vertices are tested in stack buffers */
+#define MVT_SIMPLE_RING_STACK_POINTS 128
+/** Edge pairs with overlapping boxes the sweep tests per vertex before leaving the ring to wagyu */
+#define MVT_SIMPLE_RING_PAIRS_PER_POINT 64
 /** Coordinate limit that keeps every product in the fast path exact in int64 */
 #define MVT_SIMPLE_RING_MAX_COORD (1 << 26)
 
@@ -977,34 +981,33 @@ mvt_segment_hits_pixel(int64_t ax, int64_t ay, int64_t bx, int64_t by, int64_t v
 	return true;
 }
 
+/** Orders the sweep's edge keys for qsort */
+static int
+mvt_compare_keys(const void *a, const void *b)
+{
+	const int64_t ka = *(const int64_t *)a, kb = *(const int64_t *)b;
+	return (ka > kb) - (ka < kb);
+}
+
 /**
- * Checks whether wagyu would return the polygon as it is, apart from its
+ * Checks whether wagyu would return the ring as it is, apart from its
  * orientation, its start vertex and its collinear vertices.
  * If so, fills x and y with the ring in wagyu's orientation, without the
  * closing point, sets start to wagyu's first vertex and returns the vertex
  * count. Otherwise returns 0, and the polygon has to go through wagyu.
+ * x and y hold npoints - 1 values each, work seven times as many.
  */
 static uint32_t
-mvt_simple_ring(const LWGEOM *lwgeom, const GBOX *clip_box, int64_t *x, int64_t *y, uint32_t *start)
+mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *x, int64_t *y, int64_t *work, uint32_t *start)
 {
-	const POINTARRAY *pa;
-	int64_t rx[MVT_SIMPLE_RING_MAX_POINTS], ry[MVT_SIMPLE_RING_MAX_POINTS];
-	int64_t ex0[MVT_SIMPLE_RING_MAX_POINTS], ex1[MVT_SIMPLE_RING_MAX_POINTS];
-	int64_t ey0[MVT_SIMPLE_RING_MAX_POINTS], ey1[MVT_SIMPLE_RING_MAX_POINTS];
-	int64_t keys[MVT_SIMPLE_RING_MAX_POINTS];
-	uint32_t n, m, i, i1, j, j1, k, a, b;
-	int64_t area2 = 0;
+	const uint32_t n = pa->npoints;
+	int64_t *rx = work, *ry = rx + (n - 1), *ex0 = ry + (n - 1), *ex1 = ex0 + (n - 1);
+	int64_t *ey0 = ex1 + (n - 1), *ey1 = ey0 + (n - 1), *keys = ey1 + (n - 1);
+	uint64_t area = 0, pairs = 0;
+	uint32_t m, i, i1, j, j1, k, a, b;
+	int64_t area2;
 	bool found = false;
 	uint32_t left = 0;
-
-	if (lwgeom->type != POLYGONTYPE || ((const LWPOLY *)lwgeom)->nrings != 1)
-		return 0;
-	if (FLAGS_GET_Z(lwgeom->flags) || FLAGS_GET_M(lwgeom->flags))
-		return 0;
-	pa = ((const LWPOLY *)lwgeom)->rings[0];
-	n = pa->npoints;
-	if (n < 4 || n - 1 > MVT_SIMPLE_RING_MAX_POINTS)
-		return 0;
 
 	/* Integer vertices inside the clip box, the closing point dropped */
 	for (i = 0; i < n; i++)
@@ -1046,8 +1049,10 @@ mvt_simple_ring(const LWGEOM *lwgeom, const GBOX *clip_box, int64_t *x, int64_t 
 	if (m < 3)
 		return 0;
 
+	/* Summed unsigned: a ring that winds many times can overflow on the way, a simple ring's total fits */
 	for (i = 0; i < m; i++)
-		area2 += x[i] * y[(i + 1) % m] - x[(i + 1) % m] * y[i];
+		area += (uint64_t)(x[i] * y[(i + 1) % m] - x[(i + 1) % m] * y[i]);
+	area2 = (int64_t)area;
 	if (area2 == 0)
 		return 0;
 
@@ -1066,12 +1071,18 @@ mvt_simple_ring(const LWGEOM *lwgeom, const GBOX *clip_box, int64_t *x, int64_t 
 		ey1[i] = Max(y[i], y[i1]);
 		keys[i] = (ex0[i] + MVT_SIMPLE_RING_MAX_COORD) * MVT_SIMPLE_RING_MAX_POINTS + i;
 	}
-	for (a = 1; a < m; a++)
+	/* Insertion sort is quicker for the short rings most tiles hold */
+	if (m > 64)
+		qsort(keys, m, sizeof(int64_t), mvt_compare_keys);
+	else
 	{
-		const int64_t key = keys[a];
-		for (b = a; b > 0 && keys[b - 1] > key; b--)
-			keys[b] = keys[b - 1];
-		keys[b] = key;
+		for (a = 1; a < m; a++)
+		{
+			const int64_t key = keys[a];
+			for (b = a; b > 0 && keys[b - 1] > key; b--)
+				keys[b] = keys[b - 1];
+			keys[b] = key;
+		}
 	}
 	for (a = 0; a < m; a++)
 	{
@@ -1083,6 +1094,8 @@ mvt_simple_ring(const LWGEOM *lwgeom, const GBOX *clip_box, int64_t *x, int64_t 
 			j1 = (j + 1) % m;
 			if (ex0[j] > ex1[i])
 				break;
+			if (++pairs > (uint64_t)MVT_SIMPLE_RING_PAIRS_PER_POINT * m)
+				return 0;
 			if (ey1[i] < ey0[j] || ey1[j] < ey0[i])
 				continue;
 			/* No edge may reach the pixel of a vertex it does not end at, or wagyu would snap it there */
@@ -1153,6 +1166,36 @@ mvt_write_ring(LWGEOM *lwgeom, const int64_t *x, const int64_t *y, uint32_t m, u
 	pa->npoints = m + 1;
 	lwgeom_drop_bbox(lwgeom);
 	return lwgeom;
+}
+
+/**
+ * Rewrites a single-ring polygon in place and returns true when
+ * mvt_simple_ring accepts it. Rings too long for the stack get palloc'd buffers.
+ */
+static bool
+mvt_take_fast_path(LWGEOM *lwgeom, const GBOX *clip_box)
+{
+	int64_t stack[9 * MVT_SIMPLE_RING_STACK_POINTS];
+	int64_t *buf = stack;
+	const POINTARRAY *pa;
+	uint32_t n, m, start = 0;
+
+	if (lwgeom->type != POLYGONTYPE || ((const LWPOLY *)lwgeom)->nrings != 1)
+		return false;
+	if (FLAGS_GET_Z(lwgeom->flags) || FLAGS_GET_M(lwgeom->flags))
+		return false;
+	pa = ((const LWPOLY *)lwgeom)->rings[0];
+	n = pa->npoints;
+	if (n < 4 || n - 1 > MVT_SIMPLE_RING_MAX_POINTS)
+		return false;
+	if (n - 1 > MVT_SIMPLE_RING_STACK_POINTS)
+		buf = palloc(9 * (n - 1) * sizeof(int64_t));
+	m = mvt_simple_ring(pa, clip_box, buf, buf + (n - 1), buf + 2 * (n - 1), &start);
+	if (m)
+		mvt_write_ring(lwgeom, buf, buf + (n - 1), m, start);
+	if (buf != stack)
+		pfree(buf);
+	return m > 0;
 }
 
 /*
@@ -1226,21 +1269,16 @@ mvt_clip_and_validate(LWGEOM *lwgeom, uint8_t basic_type, uint32_t extent, uint3
 		clip_box.xmin = clip_box.ymin = -(double)buffer;
 	}
 
+	if (mvt_take_fast_path(lwgeom, &clip_box))
+		return lwgeom;
 	{
-		int64_t x[MVT_SIMPLE_RING_MAX_POINTS], y[MVT_SIMPLE_RING_MAX_POINTS];
-		uint32_t start = 0;
-		uint32_t m = mvt_simple_ring(lwgeom, &clip_box, x, y, &start);
-		LWGEOM *clipped;
-		if (m)
-			return mvt_write_ring(lwgeom, x, y, m, start);
-		clipped = mvt_clipped_ring_as_wagyu_sees_it(lwgeom, &clip_box);
+		LWGEOM *clipped = mvt_clipped_ring_as_wagyu_sees_it(lwgeom, &clip_box);
 		if (clipped)
 		{
-			m = mvt_simple_ring(clipped, &clip_box, x, y, &start);
-			if (m)
+			if (mvt_take_fast_path(clipped, &clip_box))
 			{
 				clipped->srid = lwgeom->srid;
-				return mvt_write_ring(clipped, x, y, m, start);
+				return clipped;
 			}
 			lwgeom_free(clipped);
 		}

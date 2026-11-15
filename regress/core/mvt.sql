@@ -470,6 +470,29 @@ FROM (VALUES
 ) AS t(id, wkt, buffer)
 ORDER BY id;
 
+-- Rings with more vertices than the stack buffers hold: a zigzag of 329
+-- vertices inside the box, and the same zigzag across its right edge
+SELECT 'PG67', id, ST_AsText(ST_AsMVTGeom(geom,
+	ST_MakeBox2D(ST_Point(0, 0), ST_Point(10000, 10000)), 10000, 0, true))
+FROM (
+	SELECT 1 AS id, ST_MakePolygon(ST_MakeLine(p ORDER BY k)) AS geom
+	FROM (
+		SELECT k, ST_Point(9900 - 30 * k, 5000 + (k % 2) * 200) AS p FROM generate_series(0, 326) AS k
+		UNION ALL SELECT 327, ST_Point(100, 100)
+		UNION ALL SELECT 328, ST_Point(9900, 100)
+		UNION ALL SELECT 329, ST_Point(9900, 5000)
+	) AS v
+	UNION ALL
+	SELECT 2, ST_MakePolygon(ST_MakeLine(p ORDER BY k))
+	FROM (
+		SELECT k, ST_Point(12000 - 30 * k, 5000 + (k % 2) * 200) FROM generate_series(0, 326) AS k
+		UNION ALL SELECT 327, ST_Point(2200, 100)
+		UNION ALL SELECT 328, ST_Point(12000, 100)
+		UNION ALL SELECT 329, ST_Point(12000, 5000)
+	) AS v(k, p)
+) AS t
+ORDER BY id;
+
 -- geometry encoding tests
 SELECT 'TG1', encode(ST_AsMVT(q, 'test', 4096, 'geom'), 'base64') FROM (SELECT 1 AS c1,
 	ST_AsMVTGeom(ST_GeomFromText('POINT(25 17)'),
