@@ -61,3 +61,8 @@ SELECT 'multiarc1.maxerr20.sym', ST_AsText(ST_SnapToGrid(ST_CurveToLine(
 ), 2));
 
 SELECT 'ST_CurveToLine EMPTY', ST_AsHEXEWKB(ST_CurveToLine('CIRCULARSTRING EMPTY'), 'NDR');
+
+-- Linear types come back unchanged
+SELECT 'linear', ST_AsEWKB(ST_CurveToLine(g)) = ST_AsEWKB(g), ST_AsEWKT(ST_CurveToLine(g))
+FROM (VALUES ('SRID=3857;POINT(1 2)'::geometry), ('LINESTRING Z (0 0 1,1 1 2)'), ('SRID=4326;MULTIPOLYGON(((0 0,1 0,1 1,0 0)))'),
+	('TRIANGLE((0 0,0 1,1 1,0 0))'), ('TIN(((0 0 0,0 1 0,1 1 0,0 0 0)))'), ('POLYHEDRALSURFACE(((0 0 0,0 1 0,1 1 0,0 0 0)))'), ('MULTIPOINT EMPTY')) AS t(g);

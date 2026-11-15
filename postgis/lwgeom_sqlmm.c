@@ -99,7 +99,7 @@ Datum LWGEOM_curve_segmentize(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(ST_CurveToLine);
 Datum ST_CurveToLine(PG_FUNCTION_ARGS)
 {
-	GSERIALIZED *geom = PG_GETARG_GSERIALIZED_P(0);
+	GSERIALIZED *geom;
 	double tol = PG_GETARG_FLOAT8(1);
 	int toltype = PG_GETARG_INT32(2);
 	int flags = PG_GETARG_INT32(3);
@@ -110,6 +110,24 @@ Datum ST_CurveToLine(PG_FUNCTION_ARGS)
 
 	POSTGIS_DEBUGF(3, "tol = %g, typ = %d, flg = %d", tol, toltype, flags);
 
+	/* A geometry of a linear type has no arc to linearize */
+	switch (gserialized_get_type(PG_GETARG_GSERIALIZED_HEADER(0)))
+	{
+	case POINTTYPE:
+	case LINETYPE:
+	case POLYGONTYPE:
+	case MULTIPOINTTYPE:
+	case MULTILINETYPE:
+	case MULTIPOLYGONTYPE:
+	case TRIANGLETYPE:
+	case TINTYPE:
+	case POLYHEDRALSURFACETYPE:
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	default:
+		break;
+	}
+
+	geom = PG_GETARG_GSERIALIZED_P(0);
 	igeom = lwgeom_from_gserialized(geom);
 	ogeom = lwcurve_linearize(igeom, tol, toltype, flags);
 	lwgeom_free(igeom);
