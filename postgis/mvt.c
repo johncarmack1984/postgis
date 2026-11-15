@@ -902,18 +902,19 @@ mvt_clip_and_validate_geos(LWGEOM *lwgeom, uint8_t basic_type, uint32_t extent, 
 }
 
 /*
- * Most polygons in a dense tile are single rings that lie inside the clip box
- * and are still simple once snapped to the tile grid. Wagyu returns those
- * unchanged apart from their orientation, their start vertex and any collinear
- * vertex, so they are written out directly and only the rest go through wagyu.
+ * Most polygons in a dense tile are single rings, some with one hole, that lie
+ * inside the clip box and are still simple once snapped to the tile grid.
+ * Wagyu returns those unchanged apart from the orientation, the start vertex
+ * and any collinear vertex of each ring, so they are written out directly and
+ * only the rest go through wagyu.
  * The tests below use exact integer arithmetic and send any doubt to wagyu.
  */
 
-/** Most vertices a ring can have and still take the fast path */
+/** Most points a polygon can have and still take the fast path */
 #define MVT_SIMPLE_RING_MAX_POINTS (1 << 16)
-/** Rings with up to this many vertices are tested in stack buffers */
+/** Polygons with up to this many points are tested in stack buffers */
 #define MVT_SIMPLE_RING_STACK_POINTS 128
-/** Edge pairs with overlapping boxes the sweep tests per vertex before leaving the ring to wagyu */
+/** Edge pairs with overlapping boxes the sweep tests per vertex before leaving the polygon to wagyu */
 #define MVT_SIMPLE_RING_PAIRS_PER_POINT 64
 /** Coordinate limit that keeps every product in the fast path exact in int64 */
 #define MVT_SIMPLE_RING_MAX_COORD (1 << 26)
@@ -990,24 +991,22 @@ mvt_compare_keys(const void *a, const void *b)
 }
 
 /**
- * Checks whether wagyu would return the ring as it is, apart from its
- * orientation, its start vertex and its collinear vertices.
- * If so, fills x and y with the ring in wagyu's orientation, without the
- * closing point, sets start to wagyu's first vertex and returns the vertex
- * count. Otherwise returns 0, and the polygon has to go through wagyu.
- * x and y hold npoints - 1 values each, work seven times as many.
+ * Copies a ring's vertices to x and y as integers, without the closing point
+ * and without straight-through collinear vertices, sets area2 to twice its
+ * signed area and returns how many vertices it copied. Returns 0 for a ring
+ * wagyu would change in other ways: a vertex outside the clip box, off the
+ * grid or too far out, a repeated vertex, a spike, or no area.
+ * rx and ry hold npoints - 1 values each.
  */
 static uint32_t
-mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *x, int64_t *y, int64_t *work, uint32_t *start)
+mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *rx, int64_t *ry, int64_t *x, int64_t *y, int64_t *area2)
 {
 	const uint32_t n = pa->npoints;
-	int64_t *rx = work, *ry = rx + (n - 1), *ex0 = ry + (n - 1), *ex1 = ex0 + (n - 1);
-	int64_t *ey0 = ex1 + (n - 1), *ey1 = ey0 + (n - 1), *keys = ey1 + (n - 1);
-	uint64_t area = 0, pairs = 0;
-	uint32_t m, i, i1, j, j1, k, a, b;
-	int64_t area2;
-	bool found = false;
-	uint32_t left = 0;
+	uint64_t area = 0;
+	uint32_t m, i, k;
+
+	if (n < 4)
+		return 0;
 
 	/* Integer vertices inside the clip box, the closing point dropped */
 	for (i = 0; i < n; i++)
@@ -1052,9 +1051,112 @@ mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *x, int64_t 
 	/* Summed unsigned: a ring that winds many times can overflow on the way, a simple ring's total fits */
 	for (i = 0; i < m; i++)
 		area += (uint64_t)(x[i] * y[(i + 1) % m] - x[(i + 1) % m] * y[i]);
-	area2 = (int64_t)area;
-	if (area2 == 0)
+	*area2 = (int64_t)area;
+	return *area2 ? m : 0;
+}
+
+/** Next vertex in the ring of vertex i, with two rings stored one after the other and the first ending at split */
+static inline uint32_t
+mvt_ring_next(uint32_t i, uint32_t split, uint32_t total)
+{
+	if (i + 1 == split)
 		return 0;
+	if (i + 1 == total)
+		return split;
+	return i + 1;
+}
+
+/** Whether vertex (px, py), which no edge of the ring reaches, lies inside the ring */
+static bool
+mvt_point_in_ring(const int64_t *x, const int64_t *y, uint32_t m, int64_t px, int64_t py)
+{
+	bool inside = false;
+	uint32_t i, j;
+	for (i = 0, j = m - 1; i < m; j = i++)
+	{
+		/* Count the edges that cross the ray towards larger x */
+		if ((y[i] > py) != (y[j] > py) && (mvt_orient(x[j], y[j], x[i], y[i], px, py) > 0) == (y[i] > y[j]))
+			inside = !inside;
+	}
+	return inside;
+}
+
+/** Reverses the order of a ring's vertices */
+static void
+mvt_reverse_ring(int64_t *x, int64_t *y, uint32_t m)
+{
+	uint32_t i, j;
+	for (i = 0, j = m - 1; i < j; i++, j--)
+	{
+		int64_t t = x[i];
+		x[i] = x[j];
+		x[j] = t;
+		t = y[i];
+		y[i] = y[j];
+		y[j] = t;
+	}
+}
+
+/**
+ * Wagyu sweeps towards smaller y and starts each ring where the sweep closes
+ * it: at the vertex with the smallest y, the one with the largest x on a tie.
+ * If that y has horizontal edges, it starts at the vertex that follows the
+ * left end of the rightmost one in the input direction. The ring is in
+ * wagyu's orientation, and reversed says whether that reversed the input.
+ */
+static uint32_t
+mvt_ring_start(const int64_t *x, const int64_t *y, uint32_t m, bool reversed)
+{
+	uint32_t i, i1, k = 0, left = 0;
+	bool found = false;
+
+	for (i = 1; i < m; i++)
+		if (y[i] < y[k] || (y[i] == y[k] && x[i] > x[k]))
+			k = i;
+	for (i = 0; i < m; i++)
+	{
+		i1 = (i + 1) % m;
+		if (y[i] == y[k] && y[i1] == y[k] && (!found || Max(x[i], x[i1]) > Max(x[left], x[(left + 1) % m])))
+		{
+			found = true;
+			left = i;
+		}
+	}
+	if (!found)
+		return k;
+	/* Outer rings run that edge left to right, holes right to left */
+	if (x[(left + 1) % m] < x[left])
+		left = (left + 1) % m;
+	return reversed ? (left + m - 1) % m : (left + 1) % m;
+}
+
+/**
+ * Checks whether wagyu would return the polygon as it is, apart from the
+ * orientation, the start vertex and the collinear vertices of its rings: a
+ * single ring, or an outer ring with one hole inside it.
+ * If so, fills x and y with the rings in wagyu's orientation, one after the
+ * other and without their closing points, sets m and start to each ring's
+ * vertex count and first vertex, and returns true. Otherwise returns false,
+ * and the polygon has to go through wagyu.
+ * x and y hold as many values as the polygon has points, work seven times as many.
+ */
+static bool
+mvt_simple_polygon(const LWPOLY *poly, const GBOX *clip_box, int64_t *x, int64_t *y, int64_t *work, uint32_t *m, uint32_t *start)
+{
+	const uint32_t n = poly->rings[0]->npoints + (poly->nrings > 1 ? poly->rings[1]->npoints : 0);
+	int64_t *rx = work, *ry = rx + n, *ex0 = ry + n, *ex1 = ex0 + n;
+	int64_t *ey0 = ex1 + n, *ey1 = ey0 + n, *keys = ey1 + n;
+	int64_t area2[2];
+	uint64_t pairs = 0;
+	uint32_t r, total = 0, i, i1, j, j1, a, b;
+
+	for (r = 0; r < poly->nrings; r++)
+	{
+		m[r] = mvt_simple_ring(poly->rings[r], clip_box, rx, ry, x + total, y + total, &area2[r]);
+		if (!m[r])
+			return false;
+		total += m[r];
+	}
 
 	/*
 	 * Sweep the edges in order of their smallest x and test only the pairs
@@ -1062,9 +1164,9 @@ mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *x, int64_t 
 	 * pixel can only reach an edge, inside both boxes. Every vertex starts an
 	 * edge, so these pairs cover every vertex an edge could snap to.
 	 */
-	for (i = 0; i < m; i++)
+	for (i = 0; i < total; i++)
 	{
-		i1 = (i + 1) % m;
+		i1 = mvt_ring_next(i, m[0], total);
 		ex0[i] = Min(x[i], x[i1]);
 		ex1[i] = Max(x[i], x[i1]);
 		ey0[i] = Min(y[i], y[i1]);
@@ -1072,11 +1174,11 @@ mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *x, int64_t 
 		keys[i] = (ex0[i] + MVT_SIMPLE_RING_MAX_COORD) * MVT_SIMPLE_RING_MAX_POINTS + i;
 	}
 	/* Insertion sort is quicker for the short rings most tiles hold */
-	if (m > 64)
-		qsort(keys, m, sizeof(int64_t), mvt_compare_keys);
+	if (total > 64)
+		qsort(keys, total, sizeof(int64_t), mvt_compare_keys);
 	else
 	{
-		for (a = 1; a < m; a++)
+		for (a = 1; a < total; a++)
 		{
 			const int64_t key = keys[a];
 			for (b = a; b > 0 && keys[b - 1] > key; b--)
@@ -1084,77 +1186,51 @@ mvt_simple_ring(const POINTARRAY *pa, const GBOX *clip_box, int64_t *x, int64_t 
 			keys[b] = key;
 		}
 	}
-	for (a = 0; a < m; a++)
+	for (a = 0; a < total; a++)
 	{
 		i = keys[a] % MVT_SIMPLE_RING_MAX_POINTS;
-		i1 = (i + 1) % m;
-		for (b = a + 1; b < m; b++)
+		i1 = mvt_ring_next(i, m[0], total);
+		for (b = a + 1; b < total; b++)
 		{
 			j = keys[b] % MVT_SIMPLE_RING_MAX_POINTS;
-			j1 = (j + 1) % m;
+			j1 = mvt_ring_next(j, m[0], total);
 			if (ex0[j] > ex1[i])
 				break;
-			if (++pairs > (uint64_t)MVT_SIMPLE_RING_PAIRS_PER_POINT * m)
-				return 0;
+			if (++pairs > (uint64_t)MVT_SIMPLE_RING_PAIRS_PER_POINT * total)
+				return false;
 			if (ey1[i] < ey0[j] || ey1[j] < ey0[i])
 				continue;
 			/* No edge may reach the pixel of a vertex it does not end at, or wagyu would snap it there */
 			if (j != i1 && mvt_segment_hits_pixel(x[i], y[i], x[i1], y[i1], x[j], y[j]))
-				return 0;
+				return false;
 			if (i != j1 && mvt_segment_hits_pixel(x[j], y[j], x[j1], y[j1], x[i], y[i]))
-				return 0;
+				return false;
 			/* No two edges that are not neighbors may touch */
 			if (j != i1 && i != j1 &&
 			    mvt_segments_touch(x[i], y[i], x[i1], y[i1], x[j], y[j], x[j1], y[j1]))
-				return 0;
+				return false;
 		}
 	}
 
-	/* Wagyu returns a positive area in tile coordinates */
-	if (area2 < 0)
-	{
-		for (i = 0, j = m - 1; i < j; i++, j--)
-		{
-			int64_t t = x[i];
-			x[i] = x[j];
-			x[j] = t;
-			t = y[i];
-			y[i] = y[j];
-			y[j] = t;
-		}
-	}
+	/* The rings don't touch, so one vertex of the hole tells whether it lies inside the outer ring */
+	if (poly->nrings > 1 && !mvt_point_in_ring(x, y, m[0], x[m[0]], y[m[0]]))
+		return false;
 
-	/*
-	 * Wagyu sweeps towards smaller y and starts the ring where the sweep closes
-	 * it: at the vertex with the smallest y, the one with the largest x on a tie.
-	 * If that y has horizontal edges, it starts at the vertex that follows the
-	 * left end of the rightmost one in the input direction, so in the output
-	 * direction that edge runs left to right.
-	 */
-	k = 0;
-	for (i = 1; i < m; i++)
-		if (y[i] < y[k] || (y[i] == y[k] && x[i] > x[k]))
-			k = i;
-	for (i = 0; i < m; i++)
+	/* Wagyu returns outer rings with a positive area in tile coordinates, holes with a negative one */
+	for (r = 0, i = 0; r < poly->nrings; i += m[r], r++)
 	{
-		i1 = (i + 1) % m;
-		if (y[i] == y[k] && y[i1] == y[k] && (!found || x[i1] > x[(left + 1) % m]))
-		{
-			found = true;
-			left = i;
-		}
+		const bool reversed = (area2[r] > 0) != (r == 0);
+		if (reversed)
+			mvt_reverse_ring(x + i, y + i, m[r]);
+		start[r] = mvt_ring_start(x + i, y + i, m[r], reversed);
 	}
-	if (found)
-		k = area2 > 0 ? (left + 1) % m : (left + m - 1) % m;
-	*start = k;
-	return m;
+	return true;
 }
 
-/** Overwrites the polygon's ring with x and y, starting at start, and closes it */
-static LWGEOM *
-mvt_write_ring(LWGEOM *lwgeom, const int64_t *x, const int64_t *y, uint32_t m, uint32_t start)
+/** Overwrites a ring with x and y, starting at start, and closes it */
+static void
+mvt_write_ring(POINTARRAY *pa, const int64_t *x, const int64_t *y, uint32_t m, uint32_t start)
 {
-	POINTARRAY *pa = ((LWPOLY *)lwgeom)->rings[0];
 	uint32_t i;
 	for (i = 0; i <= m; i++)
 	{
@@ -1164,45 +1240,48 @@ mvt_write_ring(LWGEOM *lwgeom, const int64_t *x, const int64_t *y, uint32_t m, u
 		p->y = (double)y[v];
 	}
 	pa->npoints = m + 1;
-	lwgeom_drop_bbox(lwgeom);
-	return lwgeom;
 }
 
 /**
- * Rewrites a single-ring polygon in place and returns true when
- * mvt_simple_ring accepts it. Rings too long for the stack get palloc'd buffers.
+ * Rewrites a polygon in place and returns true when mvt_simple_polygon
+ * accepts it. Polygons too long for the stack get palloc'd buffers.
  */
 static bool
 mvt_take_fast_path(LWGEOM *lwgeom, const GBOX *clip_box)
 {
 	int64_t stack[9 * MVT_SIMPLE_RING_STACK_POINTS];
 	int64_t *buf = stack;
-	const POINTARRAY *pa;
-	uint32_t n, m, start = 0;
+	LWPOLY *poly = (LWPOLY *)lwgeom;
+	uint32_t n, m[2] = {0, 0}, start[2] = {0, 0};
+	bool simple;
 
-	if (lwgeom->type != POLYGONTYPE || ((const LWPOLY *)lwgeom)->nrings != 1)
+	if (lwgeom->type != POLYGONTYPE || poly->nrings < 1 || poly->nrings > 2)
 		return false;
 	if (FLAGS_GET_Z(lwgeom->flags) || FLAGS_GET_M(lwgeom->flags))
 		return false;
-	pa = ((const LWPOLY *)lwgeom)->rings[0];
-	n = pa->npoints;
-	if (n < 4 || n - 1 > MVT_SIMPLE_RING_MAX_POINTS)
+	n = poly->rings[0]->npoints + (poly->nrings > 1 ? poly->rings[1]->npoints : 0);
+	if (n > MVT_SIMPLE_RING_MAX_POINTS)
 		return false;
-	if (n - 1 > MVT_SIMPLE_RING_STACK_POINTS)
-		buf = palloc(9 * (n - 1) * sizeof(int64_t));
-	m = mvt_simple_ring(pa, clip_box, buf, buf + (n - 1), buf + 2 * (n - 1), &start);
-	if (m)
-		mvt_write_ring(lwgeom, buf, buf + (n - 1), m, start);
+	if (n > MVT_SIMPLE_RING_STACK_POINTS)
+		buf = palloc(9 * n * sizeof(int64_t));
+	simple = mvt_simple_polygon(poly, clip_box, buf, buf + n, buf + 2 * n, m, start);
+	if (simple)
+	{
+		mvt_write_ring(poly->rings[0], buf, buf + n, m[0], start[0]);
+		if (poly->nrings > 1)
+			mvt_write_ring(poly->rings[1], buf + m[0], buf + n + m[0], m[1], start[1]);
+		lwgeom_drop_bbox(lwgeom);
+	}
 	if (buf != stack)
 		pfree(buf);
-	return m > 0;
+	return simple;
 }
 
 /*
  * A single-ring polygon that crosses the clip box reaches wagyu as the ring
  * lwgeom_clip_to_ordinate_range cuts on X then Y, its coordinates truncated
  * to int32 (lwpoly_to_vwgpoly, ptarray_to_wglinearring). Builds that same
- * ring, so mvt_simple_ring can tell whether wagyu would return it unchanged.
+ * ring, so mvt_simple_polygon can tell whether wagyu would return it unchanged.
  */
 static LWGEOM *
 mvt_clipped_ring_as_wagyu_sees_it(const LWGEOM *lwgeom, const GBOX *clip_box)
@@ -1241,7 +1320,7 @@ mvt_clipped_ring_as_wagyu_sees_it(const LWGEOM *lwgeom, const GBOX *clip_box)
 }
 
 /* Clips a geometry in tile coordinates to the extent plus buffer, unless
- * clip_geom is false, and makes polygons valid. Polygons mvt_simple_ring
+ * clip_geom is false, and makes polygons valid. Polygons mvt_simple_polygon
  * accepts are rewritten in place, other polygons go through wagyu and
  * other types through GEOS. Might return NULL
  */

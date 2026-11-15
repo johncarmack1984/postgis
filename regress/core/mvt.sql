@@ -493,6 +493,27 @@ FROM (
 ) AS t
 ORDER BY id;
 
+-- Polygons with one hole take the fast path, everything else still goes through wagyu
+SELECT 'PG68', id, ST_AsText(ST_AsMVTGeom(
+	ST_GeomFromText(wkt),
+	ST_MakeBox2D(ST_Point(0, 0), ST_Point(100, 100)),
+	100, 0, true))
+FROM (VALUES
+	-- A hole in either direction
+	(1, 'POLYGON((0 0, 100 0, 100 100, 0 100, 0 0), (20 20, 20 80, 80 80, 80 20, 20 20))'),
+	(2, 'POLYGON((0 0, 100 0, 100 100, 0 100, 0 0), (20 20, 80 20, 80 80, 20 80, 20 20))'),
+	-- Horizontal edges at both ends of the hole, in either direction
+	(3, 'POLYGON((0 0, 0 100, 100 100, 100 0, 0 0), (30 30, 70 30, 60 70, 40 70, 30 30))'),
+	(4, 'POLYGON((0 0, 0 100, 100 100, 100 0, 0 0), (30 30, 40 70, 60 70, 70 30, 30 30))'),
+	-- A hole that touches the outer ring, lies outside it, or has a sibling
+	(5, 'POLYGON((0 0, 100 0, 100 100, 0 100, 0 0), (0 50, 40 30, 40 70, 0 50))'),
+	(6, 'POLYGON((0 0, 50 0, 50 50, 0 50, 0 0), (60 60, 90 60, 90 90, 60 60))'),
+	(7, 'POLYGON((0 0, 100 0, 100 100, 0 100, 0 0), (10 10, 10 40, 40 40, 40 10, 10 10), (60 60, 60 90, 90 90, 90 60, 60 60))'),
+	-- A hole vertex in the pixel of an outer edge, which wagyu snaps
+	(8, 'POLYGON((0 0, 100 0, 0 100, 0 0), (50 49, 20 20, 49 20, 50 49))')
+) AS t(id, wkt)
+ORDER BY id;
+
 -- geometry encoding tests
 SELECT 'TG1', encode(ST_AsMVT(q, 'test', 4096, 'geom'), 'base64') FROM (SELECT 1 AS c1,
 	ST_AsMVTGeom(ST_GeomFromText('POINT(25 17)'),
