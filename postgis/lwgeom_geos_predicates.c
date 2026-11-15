@@ -223,7 +223,10 @@ Datum ST_Intersects(PG_FUNCTION_ARGS)
 	{
 		GBOX box;
 		const GSERIALIZED *other = prep_cache->gcache.argnum == 1 ? geom2 : geom1;
-		if (gserialized_get_gbox_p(other, &box) && gbox_contains_2d(&prep_cache->rect, &box))
+		/* Written so a NaN in either box fails the test */
+		if (gserialized_get_gbox_p(other, &box) && box.xmin >= prep_cache->rect.xmin &&
+		    box.xmax <= prep_cache->rect.xmax && box.ymin >= prep_cache->rect.ymin &&
+		    box.ymax <= prep_cache->rect.ymax)
 			PG_RETURN_BOOL(true);
 	}
 
