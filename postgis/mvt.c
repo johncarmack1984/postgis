@@ -1155,6 +1155,48 @@ mvt_write_ring(LWGEOM *lwgeom, const int64_t *x, const int64_t *y, uint32_t m, u
 	return lwgeom;
 }
 
+/*
+ * A single-ring polygon that crosses the clip box reaches wagyu as the ring
+ * lwgeom_clip_to_ordinate_range cuts on X then Y, its coordinates truncated
+ * to int32 (lwpoly_to_vwgpoly, ptarray_to_wglinearring). Builds that same
+ * ring, so mvt_simple_ring can tell whether wagyu would return it unchanged.
+ */
+static LWGEOM *
+mvt_clipped_ring_as_wagyu_sees_it(const LWGEOM *lwgeom, const GBOX *clip_box)
+{
+	const LWPOLY *poly = (const LWPOLY *)lwgeom;
+	LWCOLLECTION *cx, *cy;
+	LWGEOM *out = NULL;
+	GBOX box;
+	uint32_t i;
+
+	if (lwgeom->type != POLYGONTYPE || poly->nrings != 1 || FLAGS_GET_Z(lwgeom->flags) ||
+	    FLAGS_GET_M(lwgeom->flags) || poly->rings[0]->npoints > 4 * MVT_SIMPLE_RING_MAX_POINTS)
+		return NULL;
+	if (lwgeom_calculate_gbox(lwgeom, &box) != LW_SUCCESS || gbox_contains_2d(clip_box, &box) ||
+	    !gbox_overlaps_2d(clip_box, &box))
+		return NULL;
+
+	cx = lwgeom_clip_to_ordinate_range(lwgeom, 'X', clip_box->xmin, clip_box->xmax, 0);
+	cy = lwgeom_clip_to_ordinate_range((LWGEOM *)cx, 'Y', clip_box->ymin, clip_box->ymax, 0);
+	lwgeom_free((LWGEOM *)cx);
+	if (cy && cy->ngeoms == 1 && cy->geoms[0]->type == POLYGONTYPE && ((LWPOLY *)cy->geoms[0])->nrings == 1)
+	{
+		POINTARRAY *pa = ((LWPOLY *)cy->geoms[0])->rings[0];
+		for (i = 0; i < pa->npoints; i++)
+		{
+			POINT2D *p = (POINT2D *)getPoint_internal(pa, i);
+			p->x = (double)(int32_t)p->x;
+			p->y = (double)(int32_t)p->y;
+		}
+		out = cy->geoms[0];
+		cy->ngeoms = 0;
+	}
+	if (cy)
+		lwgeom_free((LWGEOM *)cy);
+	return out;
+}
+
 /* Clips a geometry in tile coordinates to the extent plus buffer, unless
  * clip_geom is false, and makes polygons valid. Polygons mvt_simple_ring
  * accepts are rewritten in place, other polygons go through wagyu and
@@ -1187,9 +1229,21 @@ mvt_clip_and_validate(LWGEOM *lwgeom, uint8_t basic_type, uint32_t extent, uint3
 	{
 		int64_t x[MVT_SIMPLE_RING_MAX_POINTS], y[MVT_SIMPLE_RING_MAX_POINTS];
 		uint32_t start = 0;
-		const uint32_t m = mvt_simple_ring(lwgeom, &clip_box, x, y, &start);
+		uint32_t m = mvt_simple_ring(lwgeom, &clip_box, x, y, &start);
+		LWGEOM *clipped;
 		if (m)
 			return mvt_write_ring(lwgeom, x, y, m, start);
+		clipped = mvt_clipped_ring_as_wagyu_sees_it(lwgeom, &clip_box);
+		if (clipped)
+		{
+			m = mvt_simple_ring(clipped, &clip_box, x, y, &start);
+			if (m)
+			{
+				clipped->srid = lwgeom->srid;
+				return mvt_write_ring(clipped, x, y, m, start);
+			}
+			lwgeom_free(clipped);
+		}
 	}
 
 	clipped_lwgeom = lwgeom_wagyu_clip_by_box(lwgeom, &clip_box);

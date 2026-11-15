@@ -449,6 +449,27 @@ FROM (VALUES
 ) AS t(id, wkt, buffer, clip)
 ORDER BY id;
 
+-- Single rings that cross the clip box take the fast path when the ring
+-- wagyu would get after its clip is still simple
+SELECT 'PG66', id, ST_AsText(ST_AsMVTGeom(
+	ST_GeomFromText(wkt),
+	ST_MakeBox2D(ST_Point(0, 0), ST_Point(100, 100)),
+	100, buffer, true))
+FROM (VALUES
+	-- Across one edge, across a corner, across two edges
+	(1, 'POLYGON((60 20, 130 20, 130 80, 60 80, 60 20))', 0),
+	(2, 'POLYGON((70 70, 140 70, 70 140, 70 70))', 0),
+	(3, 'POLYGON((-20 40, 120 40, 120 60, -20 60, -20 40))', 0),
+	-- Into the buffer, clipped at its edge
+	(4, 'POLYGON((-30 20, 50 20, 50 80, -30 80, -30 20))', 10),
+	-- Crossings between integers, truncated as wagyu truncates them
+	(5, 'POLYGON((50 50, 150 75, 50 90, 50 50))', 0),
+	(6, 'POLYGON((-25 10, 40 10, 40 50, -25 10))', 10),
+	-- Out and back across the same edge: two parts, still through wagyu
+	(7, 'POLYGON((60 10, 130 10, 130 90, 60 90, 60 70, 120 70, 120 30, 60 30, 60 10))', 0)
+) AS t(id, wkt, buffer)
+ORDER BY id;
+
 -- geometry encoding tests
 SELECT 'TG1', encode(ST_AsMVT(q, 'test', 4096, 'geom'), 'base64') FROM (SELECT 1 AS c1,
 	ST_AsMVTGeom(ST_GeomFromText('POINT(25 17)'),
