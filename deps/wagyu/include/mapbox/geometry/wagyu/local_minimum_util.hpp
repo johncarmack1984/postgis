@@ -58,16 +58,17 @@ void start_list_on_local_maximum(edge_list<T>& edges) {
 }
 
 template <typename T>
-bound<T> create_bound_towards_minimum(edge_list<T>& edges) {
-    if (edges.size() == 1) {
-        if (is_horizontal(edges.front())) {
-            reverse_horizontal(edges.front());
+bound<T> create_bound_towards_minimum(edge_list<T>& edges, edge_list_itr<T>& first) {
+    if (std::distance(first, edges.end()) == 1) {
+        if (is_horizontal(*first)) {
+            reverse_horizontal(*first);
         }
         bound<T> bnd;
-        std::swap(bnd.edges, edges);
+        bnd.edges.push_back(std::move(*first));
+        first = edges.end();
         return bnd;
     }
-    auto next_edge = edges.begin();
+    auto next_edge = first;
     auto edge = next_edge;
     ++next_edge;
     bool edge_is_horizontal = is_horizontal(*edge);
@@ -98,25 +99,22 @@ bound<T> create_bound_towards_minimum(edge_list<T>& edges) {
         ++next_edge;
     }
     bound<T> bnd;
-    if (next_edge == edges.end()) {
-        std::swap(edges, bnd.edges);
-    } else {
-        bnd.edges.reserve(static_cast<std::size_t>(std::distance(edges.begin(), next_edge)));
-        std::move(edges.begin(), next_edge, std::back_inserter(bnd.edges));
-        edges.erase(edges.begin(), next_edge);
-    }
+    bnd.edges.reserve(static_cast<std::size_t>(std::distance(first, next_edge)));
+    std::move(first, next_edge, std::back_inserter(bnd.edges));
+    first = next_edge;
     std::reverse(bnd.edges.begin(), bnd.edges.end());
     return bnd;
 }
 
 template <typename T>
-bound<T> create_bound_towards_maximum(edge_list<T>& edges) {
-    if (edges.size() == 1) {
+bound<T> create_bound_towards_maximum(edge_list<T>& edges, edge_list_itr<T>& first) {
+    if (std::distance(first, edges.end()) == 1) {
         bound<T> bnd;
-        std::swap(bnd.edges, edges);
+        bnd.edges.push_back(std::move(*first));
+        first = edges.end();
         return bnd;
     }
-    auto next_edge = edges.begin();
+    auto next_edge = first;
     auto edge = next_edge;
     ++next_edge;
     bool edge_is_horizontal = is_horizontal(*edge);
@@ -141,13 +139,9 @@ bound<T> create_bound_towards_maximum(edge_list<T>& edges) {
         ++next_edge;
     }
     bound<T> bnd;
-    if (next_edge == edges.end()) {
-        std::swap(bnd.edges, edges);
-    } else {
-        bnd.edges.reserve(static_cast<std::size_t>(std::distance(edges.begin(), next_edge)));
-        std::move(edges.begin(), next_edge, std::back_inserter(bnd.edges));
-        edges.erase(edges.begin(), next_edge);
-    }
+    bnd.edges.reserve(static_cast<std::size_t>(std::distance(first, next_edge)));
+    std::move(first, next_edge, std::back_inserter(bnd.edges));
+    first = next_edge;
     return bnd;
 }
 
@@ -206,14 +200,17 @@ void add_ring_to_local_minima_list(edge_list<T>& edges, local_minimum_list<T>& m
 
     bound_ptr<T> first_minimum = nullptr;
     bound_ptr<T> last_maximum = nullptr;
-    while (!edges.empty()) {
+    // Bounds take their edges from the front; advancing first instead of
+    // erasing them keeps the ring's split linear in its edge count.
+    auto first = edges.begin();
+    while (first != edges.end()) {
         interrupt_check(); // Check for interruptions
         bool lm_minimum_has_horizontal = false;
-        auto to_minimum = create_bound_towards_minimum(edges);
-        if (edges.empty()) {
+        auto to_minimum = create_bound_towards_minimum(edges, first);
+        if (first == edges.end()) {
             throw std::runtime_error("Edges is empty after only creating a single bound.");
         }
-        auto to_maximum = create_bound_towards_maximum(edges);
+        auto to_maximum = create_bound_towards_maximum(edges, first);
         fix_horizontals(to_minimum);
         fix_horizontals(to_maximum);
         auto to_max_first_non_horizontal = to_maximum.edges.begin();
